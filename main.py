@@ -153,8 +153,7 @@ def custom_openapi():
         "name": "MIT",
         "url": "https://opensource.org/licenses/MIT",
     }
-    # Optional: add a servers block so Swagger "Try it out" shows a base URL
-    openapi_schema["servers"] = [{"url": "http://localhost:8000"}]
+
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
