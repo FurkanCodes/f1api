@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import uvicorn
+from datetime import datetime
 
 import fastf1
 import fastf1.plotting
@@ -102,6 +103,7 @@ class DriverInfo(BaseModel):
 class DriversResponse(BaseModel):
     year: int
     drivers: List[DriverInfo]
+    count: int
 
 # ---------- App with Swagger UI settings ----------
 
@@ -436,33 +438,62 @@ async def compare_drivers(
 
 @app.get("/drivers/{year}", response_model=DriversResponse, tags=["Seasons"])
 async def get_drivers(year: int):
-    """Get all drivers for a given yearr"""
+    """Get all drivers for a given year"""
     try:
-        # Get a race session to extract driver info
-        schedule = fastf1.get_event_schedule(year)
-        # Prefer a race event; fall back to first event if formats differ
-        race_rows = schedule[schedule["EventFormat"].isin(["conventional", "sprint", "sprint_shootout"])]
-        first_event = (race_rows.iloc[0] if not race_rows.empty else schedule.iloc[0])
+        # Get the event schedule for the year
+        schedule = fastf1.get_event_schedule(year, include_testing=False)
+        if schedule.empty:
+            raise ValueError(f"No events found for the year {year}")
+        print("schedule",schedule)
+        # Get current date to compare it to the last race in the schedule
+        now_utc = datetime.utcnow()
+  
+        # Find completed events
+        completed_events = schedule[schedule['EventDate'] < now_utc]
 
-        session = fastf1.get_session(year, first_event["EventName"], "R")
-        session.load()
+        event_to_load = None
+        if not completed_events.empty:
+            event_to_load = completed_events.iloc[-1]
+        else:
+            event_to_load = schedule.iloc[0]
+            print(f"Season not yet started. Loading drivers from the first scheduled event {event_to_load['EventName']}")
+        # Get the session object
+        session = fastf1.get_session(year, event_to_load["EventName"], "R")
+
+        # OPTIMIZED: Load only essential data. This makes the API call much faster.
+        session.load(laps=False, telemetry=False, weather=False, messages=False)
 
         drivers_info: List[DriverInfo] = []
-        for drv in session.drivers:
-            d = session.get_driver(drv)
+
+        for drv_number in session.drivers:
+            # 'driver_data' is a Pandas Series with info for that driver
+            driver_data = session.get_driver(drv_number)
+           
             drivers_info.append(
+                #Use the field names from your DriverInfo Pydantic model
                 DriverInfo(
-                    abbreviation=str(drv),
-                    full_name=d.get("FullName"),
-                    team=d.get("TeamName"),
-                    country=d.get("CountryCode"),
+                    # Assign the three-letter code to the 'abbreviation' field
+                    abbreviation=driver_data['Abbreviation'],
+                    full_name=driver_data['FullName'],
+                    team=driver_data['TeamName'],
+                    country=driver_data['CountryCode'],
                 )
             )
 
-        return {"year": year, "drivers": [di.dict() for di in drivers_info]}
+        # Sort the list alphabetically for a consistent order
+        drivers_info.sort(key=lambda d: d.abbreviation)
+
+        # FastAPI handles the conversion to a dictionary automatically
+        return {"year": year, "drivers": drivers_info, "count": len(drivers_info)}
+
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # Log the actual error for debugging
+        print(f"Error in get_drivers for year {year}: {e}")
+        # Return a more appropriate 404 if data isn't found
+        raise HTTPException(
+            status_code=404,
+            detail=f"Could not retrieve driver data for {year}. Reason: {str(e)}"
+        )
 
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+if __name__ == '__main__':
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
