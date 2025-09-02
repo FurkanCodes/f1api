@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import uvicorn
+import os
 
 import fastf1
 import fastf1.plotting
@@ -14,7 +16,9 @@ import numpy as np
 
 # Enable FastF1 plotting and cache
 fastf1.plotting.setup_mpl()
-fastf1.Cache.enable_cache("./cache")
+# Allow overriding cache dir via env var
+_cache_dir = os.getenv("FASTF1_CACHE_DIR", "./cache")
+fastf1.Cache.enable_cache(_cache_dir)
 
 # ---------- Pydantic models for nicer docs ----------
 
@@ -125,6 +129,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Compress large responses (telemetry/laps)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # ---------- OpenAPI customization (logo/contact/license/tags) ----------
 
@@ -400,14 +407,14 @@ async def compare_drivers(
                     compound=lap1.get("Compound"),
                     max_speed=float(tel1["Speed"].max()) if not tel1.empty else None,
                     avg_speed=float(tel1["Speed"].mean()) if not tel1.empty else None,
-                ).dict(),
+                ).model_dump(),
                 "driver2": CompareFastest(
                     driver=driver2,
                     lap_time=str(lap2.get("LapTime")),
                     compound=lap2.get("Compound"),
                     max_speed=float(tel2["Speed"].max()) if not tel2.empty else None,
                     avg_speed=float(tel2["Speed"].mean()) if not tel2.empty else None,
-                ).dict(),
+                ).model_dump(),
                 "gap": str(abs(lap1.get("LapTime") - lap2.get("LapTime"))) if pd.notna(lap1.get("LapTime")) and pd.notna(lap2.get("LapTime")) else None,
             }
         else:
@@ -419,12 +426,12 @@ async def compare_drivers(
                     driver=driver1,
                     average_lap_time=str(avg1) if avg1 is not None else None,
                     total_laps=len(driver1_laps),
-                ).dict(),
+                ).model_dump(),
                 "driver2": CompareAverage(
                     driver=driver2,
                     average_lap_time=str(avg2) if avg2 is not None else None,
                     total_laps=len(driver2_laps),
-                ).dict(),
+                ).model_dump(),
                 "average_gap": str(abs(avg1 - avg2)) if (avg1 is not None and avg2 is not None) else None,
             }
 
@@ -459,7 +466,7 @@ async def get_drivers(year: int):
                 )
             )
 
-        return {"year": year, "drivers": [di.dict() for di in drivers_info]}
+        return {"year": year, "drivers": [di.model_dump() for di in drivers_info]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
