@@ -18,7 +18,7 @@ Thumbs.db
 .vscode/
 
 # FastF1 Cache
-cache/
+# cache/
 
 # Build / Packaging
 dist/
