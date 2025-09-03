@@ -205,15 +205,3 @@ Analysis endpoint tips
 - Sector deltas (VER vs HAM):
   - `/analysis/sector-deltas/2024/Monaco%20Grand%20Prix/R?driver1=VER&driver2=HAM`
 
-## Notes
-
-- Telemetry availability and channel names can vary by session and year.
-- If you want friendlier inputs (e.g., round numbers instead of event names), consider adding a small mapping endpoint; happy to implement it next.
-
-Analysis endpoint tips
-- Braking zones:
-  - `GET /analysis/braking/{year}/{event}/{session_type}?driver=VER&brake_threshold=0.1&min_duration_ms=200&min_length_m=5`
-- Corners:
-  - `GET /analysis/corners/{year}/{event}/{session_type}?driver=HAM&top_n=10&min_gap_m=40`
-- Sector deltas:
-  - `GET /analysis/sector-deltas/{year}/{event}/{session_type}?driver1=VER&driver2=HAM`
