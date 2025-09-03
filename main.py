@@ -18,10 +18,10 @@ from collections import OrderedDict
 import threading
 
 # Enable FastF1 plotting and cache
-fastf1.plotting.setup_mpl()
+# fastf1.plotting.setup_mpl()
 # Allow overriding cache dir via env var
 _cache_dir = os.getenv("FASTF1_CACHE_DIR", "./cache")
-fastf1.Cache.enable_cache(_cache_dir)
+fastf1.Cache.set_disabled()
 
 # Simple in-memory LRU cache for loaded sessions
 _SESSION_CACHE_MAX = int(os.getenv("SESSION_CACHE_MAX", "3"))
