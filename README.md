@@ -21,6 +21,8 @@ API for F1 season, session, lap, telemetry, and analysis data built on FastAPI +
 - `FASTF1_CACHE_DIR`: Directory for FastF1 disk cache (default `./cache`).
 - `SESSION_CACHE_MAX`: In‑memory session cache capacity (default `3`).
 - `ENABLE_GZIP`: Set `1` to enable response compression (disabled by default).
+- `ALLOWED_ORIGINS`: Comma-separated CORS origins (default `*`).
+- `ALLOW_CREDENTIALS`: `1`/`0` to allow credentials with CORS (default `0`).
 
 ## Core Concepts
 
@@ -53,6 +55,43 @@ API for F1 season, session, lap, telemetry, and analysis data built on FastAPI +
   - `GET /analysis/braking/{year}/{event}/{session_type}` — Braking zones per lap.
   - `GET /analysis/corners/{year}/{event}/{session_type}` — Corner minimum speeds via local minima.
   - `GET /analysis/sector-deltas/{year}/{event}/{session_type}` — Sector and total time gaps between two drivers.
+  - Admin
+    - `POST /admin/cache/clear` — Clear in-memory session cache.
+
+## Endpoint Guide (What and Why)
+
+- Root
+  - `/`: Service banner with version. Why: quick sanity check and discoverability.
+  - `/health`: Health probe. Why: readiness/liveness checks for ops/monitoring.
+
+- Seasons
+  - `GET /sessions/{year}`: Season schedule (rounds, `EventName`, dates, format). Why: discovery of canonical `EventName` for other routes.
+  - `GET /drivers/{year}`: Driver roster (abbreviation, full name, team, country). Why: source of stable driver codes like `VER`, `HAM`.
+
+- Sessions
+  - `GET /session/{year}/{event}/{session_type}`: Session context (name, date, optional weather, track status). Why: adds conditions/timing context for analysis and UI.
+  - `GET /results/{year}/{event}/{session_type}`: Results/standings, JSON‑normalized. Why: canonical outcome for tables and leaderboards.
+  - `GET /laptimes/{year}/{event}/{session_type}`: Per‑lap dataset with rich fields (lap time, sectors, compound/life, flags). Filters: `drivers`, `exclude_pit`, `exclude_invalid`. Why: core feed for pace, stint, degradation analysis.
+
+- Telemetry
+  - `GET /telemetry/{year}/{event}/{session_type}`: Driver lap telemetry arrays with resampling (`distance_step` or `time_step_ms`), downsampling (`sample_every`, `max_points`), `fields` selection, and `summary_only`. Why: powers charts and overlays with compact payloads and quick summaries.
+
+- Comparisons
+  - `GET /compare/{year}/{event}/{session_type}`: Compare `driver1` vs `driver2` on `fastest` or `average` laps; optional overlay telemetry (`include_telemetry`, `distance_step`, `fields`, `sample_every`, `max_points`). Filters (`exclude_pit`, `exclude_invalid`). Why: one‑call comparison for dashboards with headline gaps and traces.
+
+- Analysis
+  - `GET /analysis/braking/{year}/{event}/{session_type}`: Braking zones with length, duration, entry/min/exit speed, avg brake, avg decel. Params: `driver`, optional `lap`, `brake_threshold`, `min_duration_ms`, `min_length_m`. Why: turns raw telemetry into actionable braking features.
+  - `GET /analysis/corners/{year}/{event}/{session_type}`: Corner apex proxies via local speed minima (distance, min_speed). Params: `driver`, optional `lap`, `min_gap_m`, `window_points`, `top_n`. Why: quick corner benchmarking without complex track segmentation.
+  - `GET /analysis/sector-deltas/{year}/{event}/{session_type}`: Sector times and total lap times + per‑sector/total gaps for two drivers. Params: `driver1`, `driver2`. Why: fast insight into where time is gained/lost.
+
+- Admin
+  - `POST /admin/cache/clear`: Clears in‑memory session cache; returns number cleared. Why: operational lever to reclaim memory/reset state in dev or constrained hosting. Protect behind trusted network in production.
+
+### Design Notes
+- Discovery first: Seasons + Drivers provide canonical inputs for all other routes.
+- Analysis‑ready: JSON normalization, filtering, resampling/downsampling, and field selection for practical dashboards and plots.
+- Case‑insensitive inputs: `event` and driver codes are normalized to reduce friction.
+- Operational control: Simple admin cache clear for quick resets.
 
 ## Seasons
 
@@ -156,8 +195,8 @@ Analysis endpoint tips
 
 ## Input Strategy
 
-- Find events: `GET /sessions/{year}`. Copy the exact `EventName` shown there.
-- Find drivers: `GET /drivers/{year}`. Use the `abbreviation` (e.g., `VER`).
+- Find events: `GET /sessions/{year}`. Event matching is case-insensitive and whitespace-normalized, but using the exact `EventName` is still recommended.
+- Find drivers: `GET /drivers/{year}`. Use the `abbreviation` (e.g., `VER`). Driver inputs are case-insensitive.
 - Session types: Use the types shown for the event (e.g., Race = `R`).
 
 ## Performance & Caching
