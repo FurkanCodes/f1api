@@ -29,7 +29,6 @@ from api.models import (
     LapTimeItem,
     CompareAverage,
     CompareFastest,
-    DriverInfo,
     BrakingZone,
     CornerItem,
 )

@@ -12,6 +12,14 @@ from api.models import (
     SectorDeltaResponse,
     CompareFastest,
     CompareAverage,
+    TyreDegResponse,
+    TyreDegStint,
+    TheoreticalBestResponse,
+    TheoreticalBestItem,
+    PaceResponse,
+    PaceItem,
+    StrategyResponse,
+    StintItem,
 )
 from api.services import get_session_cached, resolve_event_name
 from api.concurrency import run_in_thread
@@ -298,6 +306,266 @@ async def compare_drivers(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/analysis/strategy/{year}/{event}/{session_type}", response_model=StrategyResponse)
+async def strategy_stints(
+    year: int,
+    event: str,
+    session_type: str,
+    drivers: Optional[List[str]] = Query(None, description="Filter drivers; repeatable"),
+    exclude_invalid: bool = Query(True, description="Exclude invalid/inaccurate laps when available"),
+    exclude_pit: bool = Query(True, description="Exclude in/out laps from pace aggregation when available"),
+):
+    """Build per-driver stints: start/end lap, laps, compound, fresh/used, and pace metrics."""
+    try:
+        canonical_event = await run_in_thread(resolve_event_name, year, event)
+        session = await run_in_thread(get_session_cached, year, canonical_event, session_type)
+        laps = session.laps.copy()
+
+        if drivers:
+            drivers = [d.upper() for d in drivers]
+            laps = laps[laps["Driver"].isin(drivers)]
+
+        req_cols = ["Driver", "LapNumber", "LapTime", "Stint"]
+        miss = [c for c in req_cols if c not in laps.columns]
+        if miss:
+            raise HTTPException(status_code=400, detail=f"Required lap columns missing: {miss}")
+
+        # Keep originals for start/end lap computation
+        laps = laps.sort_values(["Driver", "Stint", "LapNumber"]).copy()
+
+        # Optional filters for pace stats only
+        pace = laps.copy()
+        try:
+            if exclude_invalid:
+                if "Deleted" in pace.columns:
+                    pace = pace[~pace["Deleted"].fillna(False)]
+                if "IsAccurate" in pace.columns:
+                    pace = pace[pace["IsAccurate"].fillna(True)]
+            if exclude_pit:
+                if "PitInTime" in pace.columns:
+                    pace = pace[pace["PitInTime"].isna()]
+                if "PitOutTime" in pace.columns:
+                    pace = pace[pace["PitOutTime"].isna()]
+        except Exception:
+            pass
+
+        def td_to_seconds(val):
+            try:
+                return float(val.total_seconds()) if pd.notna(val) else None
+            except Exception:
+                return None
+
+        def seconds_to_str(sec):
+            try:
+                return str(pd.to_timedelta(float(sec), unit="s")) if sec is not None else None
+            except Exception:
+                return None
+
+        pace["lap_time_seconds"] = pace["LapTime"].apply(td_to_seconds)
+        pace = pace[pd.notna(pace["lap_time_seconds"])]
+
+        items: List[StintItem] = []
+        for (drv, stint_id), grp in laps.groupby(["Driver", "Stint" ], sort=True):
+            start_lap = int(grp["LapNumber"].min()) if not grp.empty else None
+            end_lap = int(grp["LapNumber"].max()) if not grp.empty else None
+            compound = None
+            fresh = None
+            tyre_life_start = None
+            tyre_life_end = None
+            try:
+                if "Compound" in grp.columns:
+                    compound = grp["Compound"].dropna().iloc[0] if not grp["Compound"].dropna().empty else None
+                if "FreshTyre" in grp.columns:
+                    fresh = bool(grp["FreshTyre"].iloc[0]) if pd.notna(grp["FreshTyre"].iloc[0]) else None
+                if "TyreLife" in grp.columns:
+                    tl = grp["TyreLife"].dropna()
+                    if not tl.empty:
+                        tyre_life_start = int(tl.iloc[0])
+                        tyre_life_end = int(tl.iloc[-1])
+            except Exception:
+                pass
+
+            # Pace stats from filtered 'pace' subset
+            pace_grp = pace[(pace["Driver"] == drv) & (pace["Stint"] == stint_id)]
+            y = pace_grp["lap_time_seconds"].astype(float).to_numpy() if not pace_grp.empty else np.array([])
+            avg = float(np.mean(y)) if len(y) else None
+            med = float(np.median(y)) if len(y) else None
+            best = float(np.min(y)) if len(y) else None
+            worst = float(np.max(y)) if len(y) else None
+
+            items.append(
+                StintItem(
+                    driver=str(drv),
+                    stint=int(stint_id) if pd.notna(stint_id) else None,
+                    start_lap=start_lap,
+                    end_lap=end_lap,
+                    laps=int(grp.shape[0]),
+                    compound=str(compound) if compound is not None and pd.notna(compound) else None,
+                    fresh_tyre=fresh,
+                    tyre_life_start=tyre_life_start,
+                    tyre_life_end=tyre_life_end,
+                    average_lap_time=seconds_to_str(avg),
+                    median_lap_time=seconds_to_str(med),
+                    best_lap_time=seconds_to_str(best),
+                    worst_lap_time=seconds_to_str(worst),
+                )
+            )
+
+        return {
+            "year": year,
+            "event": canonical_event,
+            "session_type": session_type,
+            "items": [i.model_dump() for i in items],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/analysis/pace/{year}/{event}/{session_type}", response_model=PaceResponse)
+async def pace_analysis(
+    year: int,
+    event: str,
+    session_type: str,
+    drivers: Optional[List[str]] = Query(None, description="Filter drivers; repeatable"),
+    aggregate: str = Query("driver", pattern="^(driver|driver_stint)$", description="Aggregate level: 'driver' or 'driver_stint'"),
+    exclude_pit: bool = Query(True, description="Exclude in/out laps when available"),
+    exclude_invalid: bool = Query(True, description="Exclude invalid/inaccurate laps when available"),
+    drop_percentile: float = Query(0.0, ge=0.0, le=20.0, description="Trim both tails by this percentile to reduce outliers (0-20)"),
+):
+    """Pace/consistency aggregates per driver or per driver-stint.
+
+    Provides median/mean lap time, stddev, IQR, and linear trend slope of lap time vs. lap index.
+    """
+    try:
+        canonical_event = await run_in_thread(resolve_event_name, year, event)
+        session = await run_in_thread(get_session_cached, year, canonical_event, session_type)
+        laps = session.laps.copy()
+
+        if drivers:
+            drivers = [d.upper() for d in drivers]
+            laps = laps[laps["Driver"].isin(drivers)]
+
+        # Optional filters
+        try:
+            if exclude_pit:
+                if "PitInTime" in laps.columns:
+                    laps = laps[laps["PitInTime"].isna()]
+                if "PitOutTime" in laps.columns:
+                    laps = laps[laps["PitOutTime"].isna()]
+            if exclude_invalid:
+                if "Deleted" in laps.columns:
+                    laps = laps[~laps["Deleted"].fillna(False)]
+                if "IsAccurate" in laps.columns:
+                    laps = laps[laps["IsAccurate"].fillna(True)]
+        except Exception:
+            pass
+
+        req_cols = ["Driver", "LapNumber", "LapTime"]
+        if aggregate == "driver_stint":
+            req_cols.append("Stint")
+        miss = [c for c in req_cols if c not in laps.columns]
+        if miss:
+            raise HTTPException(status_code=400, detail=f"Required lap columns missing: {miss}")
+
+        def td_to_seconds(val):
+            try:
+                return float(val.total_seconds()) if pd.notna(val) else None
+            except Exception:
+                return None
+
+        def seconds_to_str(sec):
+            try:
+                return str(pd.to_timedelta(float(sec), unit="s")) if sec is not None else None
+            except Exception:
+                return None
+
+        # Prepare numeric lap time and sort
+        laps = laps.sort_values(["Driver", "LapNumber"]).copy()
+        laps["lap_time_seconds"] = laps["LapTime"].apply(td_to_seconds)
+        laps = laps[pd.notna(laps["lap_time_seconds"])]
+
+        group_keys = ["Driver"] if aggregate == "driver" else ["Driver", "Stint"]
+        items: List[PaceItem] = []
+        for keys, grp in laps.groupby(group_keys, sort=True):
+            grp = grp[["LapNumber", "lap_time_seconds"]].dropna()
+            if len(grp) < 2:
+                continue
+
+            y = grp["lap_time_seconds"].astype(float).to_numpy()
+            # Trim outliers symmetrically if requested
+            if drop_percentile and len(y) > 10:
+                lo = np.percentile(y, drop_percentile)
+                hi = np.percentile(y, 100.0 - drop_percentile)
+                mask = (y >= lo) & (y <= hi)
+                grp = grp.loc[mask]
+                y = grp["lap_time_seconds"].astype(float).to_numpy()
+                if len(y) < 2:
+                    continue
+
+            x = (grp.index - grp.index.min()).to_numpy().astype(float) + 1.0
+
+            slope = None
+            r2 = None
+            try:
+                if len(x) >= 2:
+                    m, b = np.polyfit(x, y, 1)
+                    slope = float(m)
+                    y_pred = m * x + b
+                    ss_res = float(np.sum((y - y_pred) ** 2))
+                    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+                    r2 = float(1 - ss_res / ss_tot) if ss_tot > 0 else None
+            except Exception:
+                pass
+
+            median_sec = float(np.median(y)) if len(y) else None
+            mean_sec = float(np.mean(y)) if len(y) else None
+            std_sec = float(np.std(y, ddof=1)) if len(y) > 1 else None
+            p25 = float(np.percentile(y, 25)) if len(y) else None
+            p75 = float(np.percentile(y, 75)) if len(y) else None
+            iqr = (p75 - p25) if (p75 is not None and p25 is not None) else None
+
+            best = seconds_to_str(float(np.min(y))) if len(y) else None
+            worst = seconds_to_str(float(np.max(y))) if len(y) else None
+
+            if aggregate == "driver":
+                drv = keys[0] if isinstance(keys, tuple) else keys
+                stint_id = None
+            else:
+                drv, stint_id = keys
+
+            items.append(
+                PaceItem(
+                    driver=str(drv),
+                    stint=int(stint_id) if stint_id is not None and pd.notna(stint_id) else None,
+                    laps=int(len(y)),
+                    median_lap_time=seconds_to_str(median_sec),
+                    mean_lap_time=seconds_to_str(mean_sec),
+                    stddev_sec=std_sec,
+                    p25_sec=p25,
+                    p75_sec=p75,
+                    iqr_sec=iqr,
+                    slope_sec_per_lap=slope,
+                    r2=r2,
+                    best_lap_time=best,
+                    worst_lap_time=worst,
+                )
+            )
+
+        return {
+            "year": year,
+            "event": canonical_event,
+            "session_type": session_type,
+            "aggregate": aggregate,
+            "items": [i.model_dump() for i in items],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/analysis/braking/{year}/{event}/{session_type}", response_model=BrakingResponse)
 async def braking_zones(
     year: int,
@@ -496,6 +764,226 @@ async def sector_deltas(
             "s3_times": s3_times,
             "total_times": total_times,
             "gaps": gaps,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/analysis/tyre-deg/{year}/{event}/{session_type}", response_model=TyreDegResponse)
+async def tyre_degradation(
+    year: int,
+    event: str,
+    session_type: str,
+    drivers: Optional[List[str]] = Query(None, description="Driver abbreviations to include (e.g., drivers=VER&drivers=HAM)"),
+    min_laps_per_stint: int = Query(3, ge=2, description="Minimum laps required to compute a stint slope"),
+    exclude_pit: bool = Query(True, description="Exclude in/out laps when columns exist"),
+    exclude_invalid: bool = Query(True, description="Exclude invalid/accurate=False laps when columns exist"),
+):
+    """Estimate tyre degradation per driver stint via linear slope of lap time vs. stint lap index.
+
+    Returns one item per driver-stint with slope in seconds/lap and simple projections.
+    """
+    try:
+        canonical_event = await run_in_thread(resolve_event_name, year, event)
+        session = await run_in_thread(get_session_cached, year, canonical_event, session_type)
+        laps = session.laps.copy()
+
+        if drivers:
+            drivers = [d.upper() for d in drivers]
+            laps = laps[laps["Driver"].isin(drivers)]
+
+        # Optional filters
+        try:
+            if exclude_pit:
+                if "PitInTime" in laps.columns:
+                    laps = laps[laps["PitInTime"].isna()]
+                if "PitOutTime" in laps.columns:
+                    laps = laps[laps["PitOutTime"].isna()]
+            if exclude_invalid:
+                if "Deleted" in laps.columns:
+                    laps = laps[~laps["Deleted"].fillna(False)]
+                if "IsAccurate" in laps.columns:
+                    laps = laps[laps["IsAccurate"].fillna(True)]
+        except Exception:
+            pass
+
+        # Prepare per-driver, per-stint groups
+        cols_needed = {"Driver", "LapNumber", "LapTime", "Stint", "Compound"}
+        missing = [c for c in cols_needed if c not in laps.columns]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Required lap columns missing: {missing}")
+
+        # Compute lap_time_seconds and per-stint lap index
+        def td_to_seconds(val):
+            try:
+                return float(val.total_seconds()) if pd.notna(val) else None
+            except Exception:
+                return None
+
+        laps = laps.sort_values(["Driver", "Stint", "LapNumber"]).copy()
+        laps["lap_time_seconds"] = laps["LapTime"].apply(td_to_seconds)
+        laps = laps[pd.notna(laps["lap_time_seconds"])]
+
+        # Assign stint lap index starting from 1 inside each driver-stint group
+        laps["stint_lap_index"] = (
+            laps.groupby(["Driver", "Stint"]).cumcount() + 1
+        )
+
+        items: List[TyreDegStint] = []
+        for (drv, stint_id), grp in laps.groupby(["Driver", "Stint"], sort=True):
+            grp = grp[["stint_lap_index", "lap_time_seconds", "Compound"]].dropna()
+            if len(grp) < min_laps_per_stint:
+                continue
+            x = grp["stint_lap_index"].astype(float).to_numpy()
+            y = grp["lap_time_seconds"].astype(float).to_numpy()
+            comp = None
+            try:
+                comp = grp["Compound"].iloc[0]
+            except Exception:
+                comp = None
+
+            slope = None
+            avg_str = None
+            proj5 = None
+            proj10 = None
+            try:
+                if len(x) >= 2:
+                    # Linear regression slope (seconds per lap)
+                    m, b = np.polyfit(x, y, 1)
+                    slope = float(m)
+                    avg = float(np.mean(y)) if len(y) else None
+                    avg_str = str(pd.to_timedelta(avg, unit="s")) if avg is not None else None
+                    proj5 = slope * 5.0 if slope is not None else None
+                    proj10 = slope * 10.0 if slope is not None else None
+            except Exception:
+                pass
+
+            items.append(
+                TyreDegStint(
+                    driver=str(drv),
+                    stint=int(stint_id) if pd.notna(stint_id) else None,
+                    compound=str(comp) if comp is not None and pd.notna(comp) else None,
+                    laps=int(len(grp)),
+                    slope_sec_per_lap=slope,
+                    average_lap_time=avg_str,
+                    projected_5lap_cost=proj5,
+                    projected_10lap_cost=proj10,
+                )
+            )
+
+        return {"year": year, "event": canonical_event, "session_type": session_type, "items": [i.model_dump() for i in items]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/analysis/theoretical-best/{year}/{event}/{session_type}", response_model=TheoreticalBestResponse)
+async def theoretical_best(
+    year: int,
+    event: str,
+    session_type: str,
+    drivers: Optional[List[str]] = Query(None, description="Limit to specific drivers; repeatable"),
+    exclude_pit: bool = Query(True, description="Exclude pit in/out laps when columns exist"),
+    exclude_invalid: bool = Query(True, description="Exclude invalid/accurate=False laps when columns exist"),
+):
+    """Compute each driver's theoretical best lap as sum of best sector times, and overall ideal from the entire session."""
+    try:
+        canonical_event = await run_in_thread(resolve_event_name, year, event)
+        session = await run_in_thread(get_session_cached, year, canonical_event, session_type)
+        laps = session.laps.copy()
+
+        if drivers:
+            drivers = [d.upper() for d in drivers]
+            laps = laps[laps["Driver"].isin(drivers)]
+
+        # Optional filters
+        try:
+            if exclude_pit:
+                if "PitInTime" in laps.columns:
+                    laps = laps[laps["PitInTime"].isna()]
+                if "PitOutTime" in laps.columns:
+                    laps = laps[laps["PitOutTime"].isna()]
+            if exclude_invalid:
+                if "Deleted" in laps.columns:
+                    laps = laps[~laps["Deleted"].fillna(False)]
+                if "IsAccurate" in laps.columns:
+                    laps = laps[laps["IsAccurate"].fillna(True)]
+        except Exception:
+            pass
+
+        needed = ["Driver", "LapTime", "Sector1Time", "Sector2Time", "Sector3Time"]
+        miss = [c for c in needed if c not in laps.columns]
+        if miss:
+            raise HTTPException(status_code=400, detail=f"Required lap columns missing: {miss}")
+
+        def tdmin(series):
+            try:
+                s = series.dropna()
+                return s.min() if not s.empty else None
+            except Exception:
+                return None
+
+        def td_to_str(val):
+            try:
+                return str(val) if pd.notna(val) else None
+            except Exception:
+                return None
+
+        items: List[TheoreticalBestItem] = []
+        # Per-driver best sectors and ideal lap
+        for drv, grp in laps.groupby("Driver"):
+            s1 = tdmin(grp["Sector1Time"]) if "Sector1Time" in grp.columns else None
+            s2 = tdmin(grp["Sector2Time"]) if "Sector2Time" in grp.columns else None
+            s3 = tdmin(grp["Sector3Time"]) if "Sector3Time" in grp.columns else None
+            ideal = None
+            try:
+                if s1 is not None and s2 is not None and s3 is not None:
+                    ideal = s1 + s2 + s3
+            except Exception:
+                pass
+            fastest = tdmin(grp["LapTime"]) if "LapTime" in grp.columns else None
+            exec_gap = None
+            try:
+                if fastest is not None and ideal is not None:
+                    # Positive means driver lost time vs theoretical
+                    exec_gap = fastest - ideal
+            except Exception:
+                pass
+            items.append(
+                TheoreticalBestItem(
+                    driver=str(drv),
+                    best_s1=td_to_str(s1),
+                    best_s2=td_to_str(s2),
+                    best_s3=td_to_str(s3),
+                    ideal_lap=td_to_str(ideal),
+                    fastest_lap=td_to_str(fastest),
+                    execution_gap=td_to_str(exec_gap),
+                )
+            )
+
+        # Overall best sectors across all considered drivers
+        s1o = tdmin(laps["Sector1Time"]) if "Sector1Time" in laps.columns else None
+        s2o = tdmin(laps["Sector2Time"]) if "Sector2Time" in laps.columns else None
+        s3o = tdmin(laps["Sector3Time"]) if "Sector3Time" in laps.columns else None
+        overall = None
+        try:
+            if s1o is not None and s2o is not None and s3o is not None:
+                overall = s1o + s2o + s3o
+        except Exception:
+            pass
+
+        return {
+            "year": year,
+            "event": canonical_event,
+            "session_type": session_type,
+            "items": [i.model_dump() for i in items],
+            "overall_best_s1": td_to_str(s1o),
+            "overall_best_s2": td_to_str(s2o),
+            "overall_best_s3": td_to_str(s3o),
+            "overall_ideal_lap": td_to_str(overall),
         }
     except HTTPException:
         raise

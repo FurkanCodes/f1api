@@ -141,15 +141,131 @@ class CompareResponse(BaseModel):
     average_gap: Optional[str] = None
 
 
-class DriverInfo(BaseModel):
-    abbreviation: str
-    full_name: Optional[str]
-    team: Optional[str]
-    country: Optional[str]
-
-
 class DriversResponse(BaseModel):
     year: int
-    drivers: List[DriverInfo]
+    # Each driver entry contains the full set of fields provided
+    # by FastF1's driver info for the loaded session (dictionary-like).
+    drivers: List[Any]
     count: int
 
+
+# --- Tyre degradation models ---
+class TyreDegStint(BaseModel):
+    driver: str
+    stint: Optional[int]
+    compound: Optional[str]
+    laps: int
+    slope_sec_per_lap: Optional[float] = None
+    average_lap_time: Optional[str] = None
+    projected_5lap_cost: Optional[float] = None
+    projected_10lap_cost: Optional[float] = None
+
+
+class TyreDegResponse(BaseModel):
+    year: int
+    event: str
+    session_type: str
+    items: List[TyreDegStint]
+
+
+# --- Theoretical best lap models ---
+class TheoreticalBestItem(BaseModel):
+    driver: str
+    best_s1: Optional[str] = None
+    best_s2: Optional[str] = None
+    best_s3: Optional[str] = None
+    ideal_lap: Optional[str] = None
+    fastest_lap: Optional[str] = None
+    execution_gap: Optional[str] = None
+
+
+class TheoreticalBestResponse(BaseModel):
+    year: int
+    event: str
+    session_type: str
+    items: List[TheoreticalBestItem]
+    overall_best_s1: Optional[str] = None
+    overall_best_s2: Optional[str] = None
+    overall_best_s3: Optional[str] = None
+    overall_ideal_lap: Optional[str] = None
+
+
+# --- Pace / Consistency models ---
+class PaceItem(BaseModel):
+    driver: str
+    stint: Optional[int] = None
+    laps: int
+    median_lap_time: Optional[str] = None
+    mean_lap_time: Optional[str] = None
+    stddev_sec: Optional[float] = None
+    p25_sec: Optional[float] = None
+    p75_sec: Optional[float] = None
+    iqr_sec: Optional[float] = None
+    slope_sec_per_lap: Optional[float] = None
+    r2: Optional[float] = None
+    best_lap_time: Optional[str] = None
+    worst_lap_time: Optional[str] = None
+
+
+class PaceResponse(BaseModel):
+    year: int
+    event: str
+    session_type: str
+    aggregate: str
+    items: List[PaceItem]
+
+
+# --- Strategy / Stints models ---
+class StintItem(BaseModel):
+    driver: str
+    stint: Optional[int]
+    start_lap: Optional[int]
+    end_lap: Optional[int]
+    laps: int
+    compound: Optional[str] = None
+    fresh_tyre: Optional[bool] = None
+    tyre_life_start: Optional[int] = None
+    tyre_life_end: Optional[int] = None
+    average_lap_time: Optional[str] = None
+    median_lap_time: Optional[str] = None
+    best_lap_time: Optional[str] = None
+    worst_lap_time: Optional[str] = None
+
+
+class StrategyResponse(BaseModel):
+    year: int
+    event: str
+    session_type: str
+    items: List[StintItem]
+
+
+# --- Pit stops / Flags models ---
+class PitStopItem(BaseModel):
+    driver: str
+    in_lap: Optional[int] = None
+    out_lap: Optional[int] = None
+    pit_in_time: Optional[str] = None
+    pit_out_time: Optional[str] = None
+    duration_seconds: Optional[float] = None
+
+
+class PitStopsResponse(BaseModel):
+    year: int
+    event: str
+    session_type: str
+    items: List[PitStopItem]
+
+
+class TrackStatusSegment(BaseModel):
+    start_time: Optional[str]
+    end_time: Optional[str]
+    code: Optional[int] = None
+    label: Optional[str] = None
+    duration_seconds: Optional[float] = None
+
+
+class FlagsResponse(BaseModel):
+    year: int
+    event: str
+    session_type: str
+    segments: List[TrackStatusSegment]

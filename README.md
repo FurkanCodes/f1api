@@ -23,6 +23,8 @@ API for F1 season, session, lap, telemetry, and analysis data built on FastAPI +
 - `ENABLE_GZIP`: Set `1` to enable response compression (disabled by default).
 - `ALLOWED_ORIGINS`: Comma-separated CORS origins (default `*`).
 - `ALLOW_CREDENTIALS`: `1`/`0` to allow credentials with CORS (default `0`).
+- `DRIVERS_CACHE_TTL_SECONDS`: TTL for in‑memory drivers cache (default `21600`, i.e., 6 hours).
+- `ERGAST_CACHE_TTL_SECONDS`: TTL for Ergast standings cache (default `1800`, i.e., 30 minutes).
 
 ## Core Concepts
 
@@ -42,11 +44,14 @@ API for F1 season, session, lap, telemetry, and analysis data built on FastAPI +
 
 - Seasons
   - `GET /sessions/{year}` — Season schedule.
-  - `GET /drivers/{year}` — Drivers and teams for the season.
+  - `GET /drivers/{year}` — Drivers and teams for the season (paginated).
+  - `GET /teams/{year}` — Teams list with colors (paginated).
+  - `GET /circuits/{year}` — Circuits per event from schedule (paginated).
+  - `GET /standings/{year}` — Driver and constructor standings with points and positions.
 - Sessions
   - `GET /session/{year}/{event}/{session_type}` — Session metadata (name, date, weather, track status when available).
-  - `GET /results/{year}/{event}/{session_type}` — Results/standings for the session.
-  - `GET /laptimes/{year}/{event}/{session_type}` — Rich per‑lap data; optional filters.
+  - `GET /results/{year}/{event}/{session_type}` — Results/standings for the session (paginated).
+  - `GET /laptimes/{year}/{event}/{session_type}` — Rich per‑lap data; optional filters (paginated).
 - Telemetry
   - `GET /telemetry/{year}/{event}/{session_type}` — Per‑lap telemetry with resampling/downsampling, field selection, and summaries.
 - Comparisons
@@ -55,8 +60,14 @@ API for F1 season, session, lap, telemetry, and analysis data built on FastAPI +
   - `GET /analysis/braking/{year}/{event}/{session_type}` — Braking zones per lap.
   - `GET /analysis/corners/{year}/{event}/{session_type}` — Corner minimum speeds via local minima.
   - `GET /analysis/sector-deltas/{year}/{event}/{session_type}` — Sector and total time gaps between two drivers.
+  - `GET /analysis/tyre-deg/{year}/{event}/{session_type}` — Tyre degradation per driver-stint (linear slope of lap time vs stint lap index).
+  - `GET /analysis/theoretical-best/{year}/{event}/{session_type}` — Per-driver ideal lap from best rolling sectors; also returns overall ideal.
+  - `GET /analysis/pace/{year}/{event}/{session_type}` — Pace/consistency aggregates per driver or per driver‑stint (median/mean, stddev, IQR, trend slope, R²).
+  - `GET /analysis/strategy/{year}/{event}/{session_type}` — Per‑driver stints with start/end lap, laps, compound, fresh/used, and pace metrics.
   - Admin
     - `POST /admin/cache/clear` — Clear in-memory session cache.
+    - `POST /admin/drivers-cache/clear` — Clear in-memory drivers cache.
+    - `POST /admin/prewarm/standings` — Precompute standings cache for a `year`.
 
 ## Endpoint Guide (What and Why)
 
@@ -66,7 +77,11 @@ API for F1 season, session, lap, telemetry, and analysis data built on FastAPI +
 
 - Seasons
   - `GET /sessions/{year}`: Season schedule (rounds, `EventName`, dates, format). Why: discovery of canonical `EventName` for other routes.
-  - `GET /drivers/{year}`: Driver roster (abbreviation, full name, team, country). Why: source of stable driver codes like `VER`, `HAM`.
+- `GET /drivers/{year}`: Driver roster with full driver info from FastF1 (all available fields, e.g., `Abbreviation`, `FullName`, `TeamName`, `CountryCode`, and others), plus convenient aliases (`abbreviation`, `full_name`, `team`, `country`).
+  - Filters (repeatable): `abbreviation=VER`, `team=Red Bull`, `country=NL`
+  - Sorting: `sort_by=abbreviation|full_name|team|country|Abbreviation|FullName` and `order=asc|desc`
+  - Fields: `fields=abbreviation&fields=full_name` to reduce payload
+  - Caching: Supports `ETag` with `If-None-Match` for conditional GETs.
 
 - Sessions
   - `GET /session/{year}/{event}/{session_type}`: Session context (name, date, optional weather, track status). Why: adds conditions/timing context for analysis and UI.
@@ -99,23 +114,66 @@ API for F1 season, session, lap, telemetry, and analysis data built on FastAPI +
 - Returns the schedule; use `EventName` for other endpoints.
 - Useful fields: round, `EventName`, dates, `EventFormat`.
 
-### GET `/drivers/{year}`
-- Returns `{ year, drivers, count }` where each driver has `abbreviation`, `full_name`, `team`, `country`.
+### GET `/drivers/{year}` (paginated)
+- Returns `{ year, drivers, count }` where each driver entry contains the full set of fields provided by FastF1 for the season (dictionary-like). For convenience and backward compatibility, the response also includes lowercase aliases: `abbreviation`, `full_name`, `team`, `country` if available.
+- Query params:
+  - `abbreviation`: Repeatable filter by 3‑letter code (case-insensitive).
+  - `team`: Repeatable filter; case-insensitive contains match on team name.
+  - `country`: Repeatable filter by country code (case-insensitive exact).
+  - `sort_by`: One of `abbreviation`, `full_name`, `team`, `country` (or original FastF1 keys `Abbreviation`, `FullName`, `TeamName`, `CountryCode`). Default: `abbreviation`.
+  - `order`: `asc` (default) or `desc`.
+  - `fields`: Repeatable; include only selected keys (aliases or original keys).
+  - `page`, `per_page`: Pagination (defaults: `1`, `50`, max `500`). Response adds `page`, `per_page`, `total`, `total_pages`, `has_next`, `has_prev`.
+
+### GET `/teams/{year}` (paginated)
+- Returns `{ year, teams, count }` where each team has `name`, optional `color` (hex) when available from FastF1 plotting.
+- Query params:
+  - `name`: Repeatable; case-insensitive contains filter.
+  - `sort_by`: `name` (default) or `TeamName`.
+  - `order`: `asc|desc`.
+  - `fields`: Repeatable; include only selected keys.
+  - `page`, `per_page`: Pagination (defaults `1`, `50`, max `500`).
+  - `include_drivers`: `true|false` include driver list per team (each with `abbreviation`, `full_name`, `country`).
+
+### GET `/circuits/{year}` (paginated)
+- Returns `{ year, circuits, count }` derived from the official schedule with helpful aliases: `name`, `official_name`, `location`, `country`, `date`, `round`.
+- Query params:
+  - `sort_by`: `round` (default), `date`, `name`, or `EventName`.
+  - `order`: `asc|desc`.
+  - `fields`: Repeatable.
+  - `page`, `per_page`: Pagination (defaults `1`, `50`, max `500`).
+
+### GET `/standings/{year}`
+- Returns: `{ year, drivers, constructors }`.
+  - `drivers`: ordered by championship `position`; each has `abbreviation`, `full_name`, `team`, `points` (season total), `latest_event_points`, `position`.
+  - `constructors`: ordered by `points` calculated as sum of member drivers’ season points; each has `team`, `points`, `position`.
+  - Caching: Supports `ETag` with `If-None-Match` for conditional GETs.
+
+### GET `/flags/{year}/{event}/{session_type}`
+- Returns `{ year, event, session_type, segments }` where segments are track status periods with `start_time`, `end_time`, numeric `code`, best‑effort `label`, and `duration_seconds`.
+
+### GET `/pits/{year}/{event}/{session_type}` (paginated)
+- Returns `{ year, event, session_type, items }` with per‑driver pit stops, including `in_lap`, `out_lap`, `pit_in_time`, `pit_out_time`, and `duration_seconds` when available.
+ - Pagination: `page`, `per_page` (defaults `1`, `100`, max `2000`). Adds standard pagination metadata in the response.
 
 ## Sessions
 
 ### GET `/session/{year}/{event}/{session_type}`
 - Returns: `session_name`, `date`, `track_status` (if available), `weather` (if available).
 
-### GET `/results/{year}/{event}/{session_type}`
+### GET `/results/{year}/{event}/{session_type}` (paginated)
 - Returns: `session_info` and `results` with JSON‑normalized values.
+ - Pagination: `page`, `per_page` (defaults `1`, `50`, max `500`). Adds standard pagination metadata in the response.
+ - Caching: Supports `ETag` with `If-None-Match` for conditional GETs.
 
-### GET `/laptimes/{year}/{event}/{session_type}`
+### GET `/laptimes/{year}/{event}/{session_type}` (paginated)
 - Query params:
   - `drivers`: Repeat to filter (e.g., `drivers=VER&drivers=HAM`).
   - `exclude_pit`: Exclude pit in/out laps when columns exist.
   - `exclude_invalid`: Exclude deleted or inaccurate laps when columns exist.
 - Returns: Array with driver, lap number, lap time, lap time seconds, sector times, compound, tyre life, team, personal best flags, etc.
+ - Pagination: `page`, `per_page` (defaults `1`, `100`, max `2000`). Adds standard pagination metadata in the response.
+ - Caching: Supports `ETag` with `If-None-Match` for conditional GETs.
 
 ## Telemetry
 
@@ -192,6 +250,44 @@ Analysis endpoint tips
   - `GET /analysis/corners/{year}/{event}/{session_type}?driver=HAM&top_n=10&min_gap_m=40`
 - Sector deltas:
   - `GET /analysis/sector-deltas/{year}/{event}/{session_type}?driver1=VER&driver2=HAM`
+
+### GET `/analysis/tyre-deg/{year}/{event}/{session_type}`
+- Params:
+  - `drivers` (repeatable, optional): Filter to specific abbreviations.
+  - `min_laps_per_stint` (default 3): Minimum laps to compute a slope.
+  - `exclude_pit` (default true): Drop pit in/out laps when available.
+  - `exclude_invalid` (default true): Drop invalid/inaccurate laps when available.
+- Output: Items with `driver`, `stint`, `compound`, `laps`, `slope_sec_per_lap`, `average_lap_time`, `projected_5lap_cost`, `projected_10lap_cost`.
+
+### GET `/analysis/theoretical-best/{year}/{event}/{session_type}`
+- Params:
+  - `drivers` (repeatable, optional): Filter drivers.
+  - `exclude_pit` (default true), `exclude_invalid` (default true).
+- Output:
+  - Per driver: `best_s1`, `best_s2`, `best_s3`, `ideal_lap`, `fastest_lap`, `execution_gap` (fastest − ideal).
+  - Overall: `overall_best_s1/s2/s3`, `overall_ideal_lap` across all considered drivers.
+
+### GET `/analysis/pace/{year}/{event}/{session_type}`
+- Params:
+  - `drivers` (repeatable, optional): Filter drivers.
+  - `aggregate`: `driver` (default) or `driver_stint`.
+  - `exclude_pit` (default true), `exclude_invalid` (default true).
+  - `drop_percentile` (0–20, default 0): Symmetric tail trimming to reduce outliers.
+- Output per item:
+  - `driver`, optional `stint`, `laps`, `median_lap_time`, `mean_lap_time`, `stddev_sec`, `p25_sec`, `p75_sec`, `iqr_sec`, `slope_sec_per_lap`, `r2`, `best_lap_time`, `worst_lap_time`.
+- Examples:
+  - By driver: `/analysis/pace/2025/Bahrain%20Grand%20Prix/R`
+  - By driver-stint with trimming: `/analysis/pace/2025/Bahrain%20Grand%20Prix/R?aggregate=driver_stint&drop_percentile=5`
+
+### GET `/analysis/strategy/{year}/{event}/{session_type}`
+- Params:
+  - `drivers` (repeatable, optional): Filter drivers.
+  - `exclude_invalid` (default true), `exclude_pit` (default true) for pace stats.
+- Output per stint:
+  - `driver`, `stint`, `start_lap`, `end_lap`, `laps`, `compound`, `fresh_tyre`, `tyre_life_start`, `tyre_life_end`, `average_lap_time`, `median_lap_time`, `best_lap_time`, `worst_lap_time`.
+- Examples:
+  - All drivers: `/analysis/strategy/2025/Bahrain%20Grand%20Prix/R`
+  - Specific: `/analysis/strategy/2025/Bahrain%20Grand%20Prix/R?drivers=VER&drivers=HAM`
 
 ## Input Strategy
 

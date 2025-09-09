@@ -10,6 +10,9 @@ class Settings:
     # CORS
     allowed_origins: list[str] = tuple(os.getenv("ALLOWED_ORIGINS", "*").split(","))  # type: ignore
     allow_credentials: bool = os.getenv("ALLOW_CREDENTIALS", "false").lower() in {"1", "true", "yes"}
+    # Caching
+    drivers_cache_ttl_seconds: int = int(os.getenv("DRIVERS_CACHE_TTL_SECONDS", str(6 * 3600)))
+    ergast_cache_ttl_seconds: int = int(os.getenv("ERGAST_CACHE_TTL_SECONDS", str(1800)))
 
 
 def get_settings() -> Settings:
