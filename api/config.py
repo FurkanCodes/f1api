@@ -13,6 +13,9 @@ class Settings:
     # Caching
     drivers_cache_ttl_seconds: int = int(os.getenv("DRIVERS_CACHE_TTL_SECONDS", str(6 * 3600)))
     ergast_cache_ttl_seconds: int = int(os.getenv("ERGAST_CACHE_TTL_SECONDS", str(1800)))
+    # Media (optional): base URL for driver photos, e.g., https://cdn.example.com/drivers
+    drivers_image_base_url: str | None = os.getenv("DRIVERS_IMAGE_BASE_URL")
+    drivers_image_ext: str = os.getenv("DRIVERS_IMAGE_EXT", "png")
 
 
 def get_settings() -> Settings:

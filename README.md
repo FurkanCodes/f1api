@@ -25,6 +25,9 @@ API for F1 season, session, lap, telemetry, and analysis data built on FastAPI +
 - `ALLOW_CREDENTIALS`: `1`/`0` to allow credentials with CORS (default `0`).
 - `DRIVERS_CACHE_TTL_SECONDS`: TTL for in‑memory drivers cache (default `21600`, i.e., 6 hours).
 - `ERGAST_CACHE_TTL_SECONDS`: TTL for Ergast standings cache (default `1800`, i.e., 30 minutes).
+- Media (optional):
+  - `DRIVERS_IMAGE_BASE_URL`: If set, responses include `photoUrl` for each driver, built as `${DRIVERS_IMAGE_BASE_URL}/{ABBR}.{ext}`.
+  - `DRIVERS_IMAGE_EXT`: File extension for driver photos (default `png`).
 
 ## Core Concepts
 
@@ -116,6 +119,8 @@ API for F1 season, session, lap, telemetry, and analysis data built on FastAPI +
 
 ### GET `/drivers/{year}` (paginated)
 - Returns `{ year, drivers, count }` where each driver entry contains the full set of fields provided by FastF1 for the season (dictionary-like). For convenience and backward compatibility, the response also includes lowercase aliases: `abbreviation`, `full_name`, `team`, `country` if available.
+- Note: This endpoint does not include championship points or positions. Use `GET /standings/{year}` to retrieve points and positions.
+ - When `DRIVERS_IMAGE_BASE_URL` is set, each driver will include `photoUrl` pointing to `{BASE}/{ABBR}.{ext}`.
 - Query params:
   - `abbreviation`: Repeatable filter by 3‑letter code (case-insensitive).
   - `team`: Repeatable filter; case-insensitive contains match on team name.
@@ -145,7 +150,7 @@ API for F1 season, session, lap, telemetry, and analysis data built on FastAPI +
 
 ### GET `/standings/{year}`
 - Returns: `{ year, drivers, constructors }`.
-  - `drivers`: ordered by championship `position`; each has `abbreviation`, `full_name`, `team`, `points` (season total), `latest_event_points`, `position`.
+  - `drivers`: ordered by championship `position`; each has `abbreviation`, `full_name`, `team`, `points` (season total), `latest_event_points`, `position`, and `photoUrl` when configured.
   - `constructors`: ordered by `points` calculated as sum of member drivers’ season points; each has `team`, `points`, `position`.
   - Caching: Supports `ETag` with `If-None-Match` for conditional GETs.
 

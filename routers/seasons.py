@@ -34,6 +34,19 @@ _ergast_latest_cache: Dict[int, Tuple[float, Dict[str, float]]] = {}
 _ERGAST_CACHE_TTL_SECONDS = int(getattr(_settings, "ergast_cache_ttl_seconds", 1800))
 
 
+def _photo_url_for_abbr(abbr: str | None) -> Optional[str]:
+    try:
+        if not abbr:
+            return None
+        base = getattr(_settings, "drivers_image_base_url", None)
+        if not base:
+            return None
+        ext = getattr(_settings, "drivers_image_ext", "png")
+        return f"{str(base).rstrip('/')}/{str(abbr).upper()}.{str(ext).lstrip('.')}"
+    except Exception:
+        return None
+
+
 def clear_drivers_cache() -> int:
     n = len(_drivers_cache)
     _drivers_cache.clear()
@@ -98,7 +111,15 @@ async def _compute_championship_standings(year: int) -> Dict[str, Dict[str, int 
     latest_evt_pts: Dict[str, float] = {}
     last_completed_name: Optional[str] = None
 
-    # Iterate all scheduled events in order; treat events with available race results as completed.
+    # Limit to completed events only to avoid unnecessary loads
+    try:
+        now_utc = datetime.utcnow()
+        if "EventDate" in schedule.columns:
+            schedule = schedule[schedule["EventDate"] < now_utc]
+    except Exception:
+        pass
+
+    # Iterate scheduled events (completed) in order; treat events with available race results as completed.
     for _, evt in schedule.iterrows():
         evt_name = evt.get("EventName")
         if not evt_name:
@@ -149,48 +170,54 @@ async def _compute_championship_standings(year: int) -> Dict[str, Dict[str, int 
         except Exception:
             pass
 
-        # Sprint points when applicable
+        # Sprint points when applicable (skip if event format indicates no sprint)
         try:
-            # Try to load a sprint; if not available, this will raise
-            s_sess = fastf1.get_session(year, evt_name, "S")
-            await run_in_thread(
-                s_sess.load,
-                laps=False,
-                telemetry=False,
-                weather=False,
-                messages=False,
-            )
-            sres = getattr(s_sess, "results", None)
-            if sres is not None and not sres.empty:
-                for r in sres.to_dict("records"):
-                    abbr = r.get("Abbreviation") or r.get("Driver")
-                    pts = r.get("Points")
-                    try:
-                        abbr_s = str(abbr) if abbr else None
-                        val = None
-                        if pts is not None:
-                            try:
-                                val = float(pts)
-                            except Exception:
-                                val = None
-                        if val is None:
-                            pos = r.get("Position") or r.get("PositionOrder") or r.get("PositionText")
-                            try:
-                                posi = int(str(pos).strip().replace("DNF", "").replace("DQ", ""))
-                            except Exception:
-                                posi = None
-                            if posi is not None and 1 <= posi <= 8:
-                                sprint_points = [8, 7, 6, 5, 4, 3, 2, 1]
-                                val = float(sprint_points[posi - 1])
-                            else:
-                                val = 0.0
-                        if abbr_s is not None:
-                            totals[abbr_s] = totals.get(abbr_s, 0.0) + val
-                            evt_points[abbr_s] = evt_points.get(abbr_s, 0.0) + val
-                    except Exception:
-                        pass
+            fmt = str(evt.get("EventFormat") or "").lower()
+            has_sprint = ("sprint" in fmt) if fmt else True  # default True if unknown
         except Exception:
-            pass
+            has_sprint = True
+
+        if has_sprint:
+            try:
+                s_sess = fastf1.get_session(year, evt_name, "S")
+                await run_in_thread(
+                    s_sess.load,
+                    laps=False,
+                    telemetry=False,
+                    weather=False,
+                    messages=False,
+                )
+                sres = getattr(s_sess, "results", None)
+                if sres is not None and not sres.empty:
+                    for r in sres.to_dict("records"):
+                        abbr = r.get("Abbreviation") or r.get("Driver")
+                        pts = r.get("Points")
+                        try:
+                            abbr_s = str(abbr) if abbr else None
+                            val = None
+                            if pts is not None:
+                                try:
+                                    val = float(pts)
+                                except Exception:
+                                    val = None
+                            if val is None:
+                                pos = r.get("Position") or r.get("PositionOrder") or r.get("PositionText")
+                                try:
+                                    posi = int(str(pos).strip().replace("DNF", "").replace("DQ", ""))
+                                except Exception:
+                                    posi = None
+                                if posi is not None and 1 <= posi <= 8:
+                                    sprint_points = [8, 7, 6, 5, 4, 3, 2, 1]
+                                    val = float(sprint_points[posi - 1])
+                                else:
+                                    val = 0.0
+                            if abbr_s is not None:
+                                totals[abbr_s] = totals.get(abbr_s, 0.0) + val
+                                evt_points[abbr_s] = evt_points.get(abbr_s, 0.0) + val
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         # If we collected any points for this event, declare it the latest completed
         if evt_points:
@@ -393,17 +420,6 @@ async def get_drivers(
         else:
             drivers_info = cached[1]
 
-        # Merge championship standings (cached per year)
-        # Prefer Ergast totals for reliability; fall back to local computation
-        standings = _ergast_points_map(year) or {}
-        if not standings:
-            s_cached = _standings_cache.get(year)
-            if s_cached is None or (now - s_cached[0]) > _DRIVERS_CACHE_TTL_SECONDS:
-                standings = await _compute_championship_standings(year)
-                _standings_cache[year] = (now, standings)
-            else:
-                standings = s_cached[1]
-
         items = drivers_info
 
         # Filtering
@@ -452,24 +468,14 @@ async def get_drivers(
         except Exception:
             items = sorted(items, key=lambda d: str(d.get(k) or "").lower(), reverse=reverse)
 
-        # Enrich with championship points and positions
-        def enrich(d: dict) -> dict:
+        # No standings enrichment here. Use /standings for points/positions.
+        items = [dict(x) for x in items]
+        # Attach optional driver photo URL for frontend use
+        for d in items:
             abbr = str(d.get("abbreviation") or d.get("Abbreviation") or "").upper()
-            st = standings.get(abbr)
-            if st:
-                total = st.get("total")
-                latest = st.get("latest")
-                posn = st.get("position")
-                # Explicit cumulative vs latest
-                d["season_total_points"] = total
-                d["season_position"] = posn
-                d["latest_event_points"] = latest
-                # Back-compat aliases
-                d["championship_points"] = total
-                d["championship_position"] = posn
-            return d
-
-        items = [enrich(dict(x)) for x in items]
+            url = _photo_url_for_abbr(abbr)
+            if url:
+                d["photoUrl"] = url
 
         # Field selection
         if fields:
@@ -501,27 +507,7 @@ async def get_drivers(
 @router.get("/standings/{year}")
 async def get_standings(year: int, request: Request):
     try:
-        # Prefer official Ergast standings when available
-        erg = _fetch_ergast_standings(year)
-        if erg:
-            drivers_list, constructors_list = erg
-            # Augment drivers with latest_event_points if available
-            latest = _fetch_ergast_latest_points(year)
-            if latest:
-                for d in drivers_list:
-                    code = str(d.get("abbreviation") or "").upper()
-                    d["latest_event_points"] = float(latest.get(code, 0.0))
-            payload = {"year": year, "drivers": drivers_list, "constructors": constructors_list}
-            content = jsonable_encoder(payload, exclude_none=True)
-            etag = hashlib.md5(str(content).encode("utf-8")).hexdigest()
-            inm = request.headers.get("if-none-match")
-            if inm and inm == etag:
-                return Response(status_code=304, headers={"ETag": etag})
-            resp = JSONResponse(content=content)
-            resp.headers["ETag"] = etag
-            return resp
-
-        # Load drivers (for mapping names/teams) from cache, then compute totals
+        # Load drivers (for mapping names/teams) from cache, then compute totals via FastF1 only
         now = time.time()
         cached = _drivers_cache.get(year)
         if cached is None or (now - cached[0]) > _DRIVERS_CACHE_TTL_SECONDS:
@@ -530,7 +516,7 @@ async def get_standings(year: int, request: Request):
         else:
             drivers_info = cached[1]
 
-        # Load standings (totals + latest + pos)
+        # Load standings (totals + latest + pos) using FastF1 results
         s_cached = _standings_cache.get(year)
         if s_cached is None or (now - s_cached[0]) > _DRIVERS_CACHE_TTL_SECONDS:
             standings = await _compute_championship_standings(year)
@@ -550,6 +536,7 @@ async def get_standings(year: int, request: Request):
                 "points": st.get("total"),
                 "latest_event_points": st.get("latest"),
                 "position": st.get("position"),
+                "photoUrl": _photo_url_for_abbr(abbr),
             })
 
         # Fallback: if no points yet (e.g., pre-season), list roster with zeroes
@@ -563,6 +550,7 @@ async def get_standings(year: int, request: Request):
                     "points": 0.0,
                     "latest_event_points": 0.0,
                     "position": None,
+                    "photoUrl": _photo_url_for_abbr(abbr),
                 })
             # Sort alphabetically for stable order
             drivers_list = sorted(drivers_list, key=lambda x: (str(x.get("full_name") or x.get("abbreviation") or "").lower()))
@@ -636,10 +624,12 @@ async def get_teams(
                 }
             if include_drivers:
                 lst = team_map[key].setdefault("drivers", [])
+                abbr = d.get("abbreviation") or d.get("Abbreviation")
                 lst.append({
-                    "abbreviation": d.get("abbreviation") or d.get("Abbreviation"),
+                    "abbreviation": abbr,
                     "full_name": d.get("full_name") or d.get("FullName"),
                     "country": d.get("country") or d.get("CountryCode"),
+                    "photoUrl": _photo_url_for_abbr(abbr),
                 })
 
         items = list(team_map.values())
